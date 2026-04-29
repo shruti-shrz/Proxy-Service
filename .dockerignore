@@ -1,0 +1,12 @@
+.env
+auth.db
+*.db
+*.sqlite3
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage

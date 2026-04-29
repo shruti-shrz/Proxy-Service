@@ -103,20 +103,54 @@ Generate a strong secret:
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Run Services
+## Running Locally
 
-Start each service in its own terminal from the project root.
+Make sure ports `8000`, `8001`, and `8002` are free before starting. Each service needs its own terminal. Run all commands from the project root.
 
+**Terminal 1 — Auth service**
 ```bash
-# Auth service
 uvicorn auth_service.main:app --host 0.0.0.0 --port 8000 --reload
+```
 
-# Backend service A
+**Terminal 2 — Backend service A**
+```bash
 uvicorn backend_service_a.main:app --host 0.0.0.0 --port 8001 --reload
+```
 
-# Backend service B
+**Terminal 3 — Backend service B**
+```bash
 uvicorn backend_service_b.main:app --host 0.0.0.0 --port 8002 --reload
 ```
+
+To stop a service press `Ctrl+C` in its terminal. If a port is still in use after stopping, find and kill the process:
+
+```powershell
+# find the PID holding the port (replace 8000 with whichever port)
+netstat -ano | findstr :8000
+
+# kill it (replace <PID> with the number from the output)
+Stop-Process -Id <PID> -Force
+```
+
+## Running with Docker
+
+Requires Docker Desktop to be running.
+
+```bash
+# build images and start all 3 containers
+docker compose up --build
+
+# start without rebuilding (after the first time)
+docker compose up
+
+# stop all containers
+docker compose down
+
+# stop and delete the database volume too
+docker compose down -v
+```
+
+The auth service database (`auth.db`) is stored in a named Docker volume so it persists across restarts. It is reset only when you run `docker compose down -v`.
 
 ## Seed Accounts
 
