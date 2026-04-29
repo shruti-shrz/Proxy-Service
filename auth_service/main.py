@@ -10,7 +10,7 @@ import jwt
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 app = FastAPI(title="Auth Service", version="1.0.0")
@@ -39,6 +39,27 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
     expires_in: int
     role: str
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=128)
+    role: str = Field(default="user")
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: str
+    is_active: bool
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+ALLOWED_ROLES = {"user", "admin"}
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> str:
@@ -124,6 +145,17 @@ def get_bearer_token(credentials: Optional[HTTPAuthorizationCredentials]) -> str
     return credentials.credentials
 
 
+def get_current_claims(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
+    token = get_bearer_token(credentials)
+    return decode_access_token(token)
+
+
+def require_admin(claims: dict = Depends(get_current_claims)) -> dict:
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    return claims
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
@@ -156,6 +188,31 @@ def login(payload: LoginRequest) -> LoginResponse:
     )
 
 
+@app.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def register(payload: RegisterRequest) -> UserResponse:
+    role = payload.role.lower()
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE username = ?", (payload.username,))
+    existing_user = cur.fetchone()
+    if existing_user:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists")
+
+    password_hash = hash_password(payload.password)
+    cur.execute(
+        "INSERT INTO users (username, password_hash, role, is_active) VALUES (?, ?, ?, ?)",
+        (payload.username, password_hash, role, 1),
+    )
+    conn.commit()
+    user_id = cur.lastrowid
+    conn.close()
+    return UserResponse(id=user_id, username=payload.username, role=role, is_active=True)
+
+
 @app.get("/verify")
 def verify(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
     token = get_bearer_token(credentials)
@@ -167,6 +224,74 @@ def verify(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_
         "role": claims["role"],
         "exp": claims["exp"],
     }
+
+
+@app.get("/me", response_model=UserResponse)
+def me(claims: dict = Depends(get_current_claims)) -> UserResponse:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username, role, is_active FROM users WHERE id = ?", (claims["sub"],))
+    user = cur.fetchone()
+    conn.close()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return UserResponse(
+        id=user["id"],
+        username=user["username"],
+        role=user["role"],
+        is_active=bool(user["is_active"]),
+    )
+
+
+@app.post("/change-password")
+def change_password(payload: ChangePasswordRequest, claims: dict = Depends(get_current_claims)) -> dict:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT password_hash FROM users WHERE id = ?", (claims["sub"],))
+    user = cur.fetchone()
+    if not user:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if not verify_password(payload.current_password, user["password_hash"]):
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Current password is incorrect")
+    new_hash = hash_password(payload.new_password)
+    cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (new_hash, claims["sub"]))
+    conn.commit()
+    conn.close()
+    return {"message": "Password updated successfully"}
+
+
+@app.get("/users", response_model=list[UserResponse])
+def list_users(_: dict = Depends(require_admin)) -> list[UserResponse]:
+    conn = get_connection()
+    cur = conn.cursor()
+    users = cur.execute("SELECT id, username, role, is_active FROM users ORDER BY id").fetchall()
+    conn.close()
+    return [
+        UserResponse(
+            id=user["id"],
+            username=user["username"],
+            role=user["role"],
+            is_active=bool(user["is_active"]),
+        )
+        for user in users
+    ]
+
+
+@app.patch("/users/{username}/deactivate")
+def deactivate_user(username: str, _: dict = Depends(require_admin)) -> dict:
+    if username == "bob":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot deactivate default admin")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET is_active = 0 WHERE username = ?", (username,))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    conn.commit()
+    conn.close()
+    return {"message": f"User '{username}' deactivated"}
 
 
 @app.post("/logout")
