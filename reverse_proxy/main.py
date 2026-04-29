@@ -429,12 +429,31 @@ async def index(request: Request):
         </div>
 
         <div class="card">
-          <h2>Backend Services</h2>
-          Backend services should not be directly accessible.
-          <ul>
-            <li><a href="http://localhost:8001/data">http://localhost:8001/data</a></li>
-            <li><a href="http://localhost:8002/admin-data">http://localhost:8002/admin-data</a></li>
-          </ul>
+            <h2>Internal Service Isolation</h2>
+            <p>
+                These services should <strong>not</strong> be directly accessible from the host.
+                They should only be reachable through the reverse proxy at
+                <code>http://localhost:8080</code>.
+            </p>
+
+            
+            <small>Expected: connection refused / unable to connect</small>
+            <ul>
+                <li>
+                Auth Service:
+                <a href="http://localhost:8000/health">http://localhost:8000/health</a>
+                </li>
+
+                <li>
+                Backend Service A:
+                <a href="http://localhost:8001/data">http://localhost:8001/data</a>
+                </li>
+
+                <li>
+                Backend Service B:
+                <a href="http://localhost:8002/admin-data">http://localhost:8002/admin-data</a>
+                </li>
+            </ul>
         </div>
       </body>
     </html>
