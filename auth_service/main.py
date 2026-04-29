@@ -3,6 +3,7 @@ import sqlite3
 import hashlib
 import hmac
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -23,6 +24,7 @@ DB_PATH = os.getenv("AUTH_DB_PATH", "auth.db")
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
 PBKDF2_ITERATIONS = int(os.getenv("PBKDF2_ITERATIONS", "100000"))
 
 if not JWT_SECRET:
@@ -36,8 +38,10 @@ class LoginRequest(BaseModel):
 
 class LoginResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     expires_in: int
+    refresh_expires_in: int
     role: str
 
 
@@ -57,6 +61,10 @@ class UserResponse(BaseModel):
 class ChangePasswordRequest(BaseModel):
     current_password: str = Field(min_length=8, max_length=128)
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=32)
 
 
 ALLOWED_ROLES = {"user", "admin"}
@@ -100,6 +108,35 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            is_revoked INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            revoked_at INTEGER,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS refresh_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            is_revoked INTEGER NOT NULL DEFAULT 0,
+            revoked_at INTEGER,
+            replaced_by_hash TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id)
+        )
+        """
+    )
     conn.commit()
 
     cur.execute("SELECT COUNT(*) AS count FROM users")
@@ -117,13 +154,15 @@ def init_db() -> None:
     conn.close()
 
 
-def create_access_token(user_id: int, username: str, role: str) -> str:
+def create_access_token(user_id: int, username: str, role: str, session_id: str) -> str:
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
         "sub": str(user_id),
         "username": username,
         "role": role,
+        "sid": session_id,
+        "typ": "access",
         "iat": int(now.timestamp()),
         "exp": int(expires_at.timestamp()),
     }
@@ -132,11 +171,49 @@ def create_access_token(user_id: int, username: str, role: str) -> str:
 
 def decode_access_token(token: str) -> dict:
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token expired") from exc
     except jwt.InvalidTokenError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from exc
+    if claims.get("typ") != "access" or "sid" not in claims:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access token")
+    return claims
+
+
+def hash_refresh_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_refresh_token(conn: sqlite3.Connection, user_id: int, session_id: str) -> tuple[str, int, str]:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = hash_refresh_token(raw_token)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    expires_at = int((datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)).timestamp())
+    conn.execute(
+        """
+        INSERT INTO refresh_tokens (token_hash, user_id, session_id, expires_at, created_at, is_revoked)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        (token_hash, user_id, session_id, expires_at, now_ts),
+    )
+    return raw_token, expires_at, token_hash
+
+
+def revoke_session(conn: sqlite3.Connection, session_id: str) -> None:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    conn.execute(
+        "UPDATE sessions SET is_revoked = 1, revoked_at = ? WHERE id = ?",
+        (now_ts, session_id),
+    )
+    conn.execute(
+        """
+        UPDATE refresh_tokens
+        SET is_revoked = 1, revoked_at = ?
+        WHERE session_id = ? AND is_revoked = 0
+        """,
+        (now_ts, session_id),
+    )
 
 
 def get_bearer_token(credentials: Optional[HTTPAuthorizationCredentials]) -> str:
@@ -147,7 +224,15 @@ def get_bearer_token(credentials: Optional[HTTPAuthorizationCredentials]) -> str
 
 def get_current_claims(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
     token = get_bearer_token(credentials)
-    return decode_access_token(token)
+    claims = decode_access_token(token)
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT is_revoked FROM sessions WHERE id = ?", (claims["sid"],))
+    session = cur.fetchone()
+    conn.close()
+    if not session or session["is_revoked"] == 1:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked")
+    return claims
 
 
 def require_admin(claims: dict = Depends(get_current_claims)) -> dict:
@@ -180,10 +265,23 @@ def login(payload: LoginRequest) -> LoginResponse:
     if user["is_active"] != 1:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
 
-    token = create_access_token(user["id"], user["username"], user["role"])
+    conn = get_connection()
+    session_id = str(uuid.uuid4())
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    conn.execute(
+        "INSERT INTO sessions (id, user_id, is_revoked, created_at) VALUES (?, ?, 0, ?)",
+        (session_id, user["id"], now_ts),
+    )
+    refresh_token, refresh_expires_at, _ = issue_refresh_token(conn, user["id"], session_id)
+    conn.commit()
+    conn.close()
+
+    token = create_access_token(user["id"], user["username"], user["role"], session_id)
     return LoginResponse(
         access_token=token,
+        refresh_token=refresh_token,
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        refresh_expires_in=max(0, refresh_expires_at - now_ts),
         role=user["role"],
     )
 
@@ -214,16 +312,87 @@ def register(payload: RegisterRequest) -> UserResponse:
 
 
 @app.get("/verify")
-def verify(credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)) -> dict:
-    token = get_bearer_token(credentials)
-    claims = decode_access_token(token)
+def verify(claims: dict = Depends(get_current_claims)) -> dict:
     return {
         "valid": True,
         "user_id": claims["sub"],
         "username": claims["username"],
         "role": claims["role"],
+        "session_id": claims["sid"],
         "exp": claims["exp"],
     }
+
+
+@app.post("/refresh", response_model=LoginResponse)
+def refresh(payload: RefreshRequest) -> LoginResponse:
+    token_hash = hash_refresh_token(payload.refresh_token)
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT rt.*, u.username, u.role, u.is_active, s.is_revoked AS session_revoked
+        FROM refresh_tokens rt
+        JOIN users u ON u.id = rt.user_id
+        JOIN sessions s ON s.id = rt.session_id
+        WHERE rt.token_hash = ?
+        """,
+        (token_hash,),
+    )
+    token_row = cur.fetchone()
+
+    if not token_row:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+
+    if token_row["is_revoked"] == 1:
+        revoke_session(conn, token_row["session_id"])
+        conn.commit()
+        conn.close()
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token reuse detected. Session revoked.",
+        )
+
+    if token_row["expires_at"] <= now_ts:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token expired")
+
+    if token_row["session_revoked"] == 1:
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked")
+
+    if token_row["is_active"] != 1:
+        revoke_session(conn, token_row["session_id"])
+        conn.commit()
+        conn.close()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User is inactive")
+
+    new_refresh_token, refresh_expires_at, new_hash = issue_refresh_token(
+        conn, token_row["user_id"], token_row["session_id"]
+    )
+    cur.execute(
+        """
+        UPDATE refresh_tokens
+        SET is_revoked = 1, revoked_at = ?, replaced_by_hash = ?
+        WHERE token_hash = ?
+        """,
+        (now_ts, new_hash, token_hash),
+    )
+    conn.commit()
+    conn.close()
+
+    access_token = create_access_token(
+        token_row["user_id"], token_row["username"], token_row["role"], token_row["session_id"]
+    )
+    return LoginResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        refresh_expires_in=max(0, refresh_expires_at - now_ts),
+        role=token_row["role"],
+    )
 
 
 @app.get("/me", response_model=UserResponse)
@@ -295,5 +464,9 @@ def deactivate_user(username: str, _: dict = Depends(require_admin)) -> dict:
 
 
 @app.post("/logout")
-def logout() -> dict:
-    return {"message": "Client must discard token. Stateless JWT logout acknowledged."}
+def logout(claims: dict = Depends(get_current_claims)) -> dict:
+    conn = get_connection()
+    revoke_session(conn, claims["sid"])
+    conn.commit()
+    conn.close()
+    return {"message": "Session revoked successfully"}
