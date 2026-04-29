@@ -1,8 +1,23 @@
 services:
-  auth_service:
+  reverse_proxy:
     build: .
     ports:
-      - "8000:8000"
+      - "8080:8080"
+    command: uvicorn reverse_proxy.main:app --host 0.0.0.0 --port 8080
+    environment:
+      - AUTH_SERVICE_URL=http://auth_service:8000
+      - BACKEND_A_URL=http://backend_a:8001
+      - BACKEND_B_URL=http://backend_b:8002
+    depends_on:
+      - auth_service
+      - backend_a
+      - backend_b
+    networks:
+      - edge
+      - internal
+
+  auth_service:
+    build: .
     command: uvicorn auth_service.main:app --host 0.0.0.0 --port 8000
     env_file:
       - .env
@@ -10,18 +25,30 @@ services:
       - AUTH_DB_PATH=/data/auth.db
     volumes:
       - auth_db:/data
+    expose:
+      - "8000"
+    networks:
+      - internal
 
   backend_a:
     build: .
-    ports:
-      - "8001:8001"
     command: uvicorn backend_service_a.main:app --host 0.0.0.0 --port 8001
+    expose:
+      - "8001"
+    networks:
+      - internal
 
   backend_b:
     build: .
-    ports:
-      - "8002:8002"
     command: uvicorn backend_service_b.main:app --host 0.0.0.0 --port 8002
+    expose:
+      - "8002"
+    networks:
+      - internal
 
 volumes:
   auth_db:
+
+networks:
+  edge:
+  internal:

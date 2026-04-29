@@ -1,32 +1,72 @@
 # Proxy-Service
 
-Centralized authentication and role-based access control (RBAC) proxy prototype using FastAPI.
+Centralized authentication and role-based access control (RBAC) reverse proxy prototype using FastAPI and Docker Compose.
 
 ## Purpose
 
-This project demonstrates how to protect internal services by requiring authentication and applying role-aware authorization before forwarding requests to backend resources. A reverse proxy intercepts all traffic, validates tokens against a central auth service, and enforces RBAC policies — backend services themselves contain no auth logic.
+This project demonstrates how to protect internal web services using a centralized reverse proxy. Users must authenticate before accessing backend services, and access is restricted based on role. The backend services themselves do not implement authentication or authorization logic; all enforcement happens at the proxy.
+
+The prototype demonstrates:
+
+- unauthenticated users are redirected to login
+- authenticated users can access only routes permitted by their role
+- backend services are reachable only through the reverse proxy
+- sessions are maintained using secure browser cookies
+- logout revokes the current auth session
+
+---
 
 ## Architecture
 
-```
-Client
+```text
+Browser
   │
   ▼
-Reverse Proxy  ──── calls /verify ────▶  Auth Service (port 8000)
-  │                                          │
-  │  (if allowed)                            ├── SQLite DB (users, sessions, tokens)
-  ▼                                          └── Issues JWT + refresh tokens
-Backend Service A (port 8001)   ← any authenticated user
-Backend Service B (port 8002)   ← admin role only
+Reverse Proxy :8080
+  │
+  ├── calls /login, /verify, /refresh, /logout
+  │
+  ▼
+Auth Service :8000
+  │
+  ├── SQLite DB
+  ├── users
+  ├── sessions
+  └── refresh tokens
+
+Reverse Proxy
+  │
+  ├── /app/*   ─────▶ Backend Service A :8001
+  │                  any authenticated user
+  │
+  └── /admin/* ─────▶ Backend Service B :8002
+                     admin only
 ```
 
-### High-Level Flow
+Only the reverse proxy is exposed to the host machine:
 
-1. Client authenticates with `auth_service` and receives a JWT access token and a refresh token.
-2. Client sends subsequent requests with the JWT in the `Authorization: Bearer` header.
-3. Reverse proxy calls `auth_service /verify` to validate the token and retrieve claims.
-4. Reverse proxy applies RBAC policy based on the role claim.
-5. Request is forwarded to the backend service only if the policy allows it.
+```text
+http://localhost:8080
+```
+
+The auth service and backend services are private Docker services and are not directly reachable from the host.
+
+---
+
+## High-Level Flow
+
+1. User visits a protected route such as `/app/data`.
+2. Reverse proxy checks for an access token cookie.
+3. If no valid token exists, the user is redirected to `/login`.
+4. User submits username/password to the proxy login page.
+5. Proxy calls the auth service `/login` endpoint.
+6. Auth service returns an access token and refresh token.
+7. Proxy stores tokens in `HttpOnly` cookies.
+8. On future requests, the proxy validates the access token using `/verify`.
+9. Proxy applies RBAC policy.
+10. If allowed, the request is forwarded to the correct backend service.
+
+---
 
 ## Project Structure
 
@@ -35,52 +75,97 @@ Proxy-Service/
 ├── auth_service/
 │   └── main.py              # Auth service: login, register, verify, refresh, sessions
 ├── backend_service_a/
-│   └── main.py              # General backend (any authenticated user)
+│   └── main.py              # General backend, available to authenticated users
 ├── backend_service_b/
-│   └── main.py              # Admin backend (admin role only)
-├── .env.example             # Environment variable template
-├── .env                     # Local config (not committed)
-├── .gitignore
+│   └── main.py              # Admin backend, available to admins only
+├── reverse_proxy/
+│   └── main.py              # Login page, session cookies, RBAC, request forwarding
+├── AUTH_API.md              # Auth service API documentation
+├── docker-compose.yml
+├── Dockerfile
 ├── requirements.txt
+├── .env.example
+├── .env                     # Local config, not committed
 └── README.md
 ```
 
+---
+
 ## Tech Stack
 
-| Component         | Technology                        |
-|-------------------|-----------------------------------|
-| Language          | Python 3.10+                      |
-| Web framework     | FastAPI                           |
-| ASGI server       | Uvicorn                           |
-| Authentication    | JWT (PyJWT, HS256)                |
-| Database          | SQLite (file-based, no setup needed) |
-| Password hashing  | PBKDF2-HMAC-SHA256 (100 000 iters)|
-| Config            | python-dotenv                     |
+| Component | Technology |
+|---|---|
+| Language | Python 3.10+ / 3.11 |
+| Web framework | FastAPI |
+| ASGI server | Uvicorn |
+| Reverse proxy logic | FastAPI + HTTPX |
+| Authentication | JWT access tokens |
+| Session continuation | Refresh tokens |
+| Database | SQLite |
+| Password hashing | PBKDF2-HMAC-SHA256 |
+| Containerization | Docker Compose |
+
+---
+
+## Services
+
+| Service | Internal Address | Host Access | Description |
+|---|---|---:|---|
+| Reverse Proxy | `reverse_proxy:8080` | `localhost:8080` | Main entry point |
+| Auth Service | `auth_service:8000` | Not exposed | Issues/verifies tokens |
+| Backend A | `backend_a:8001` | Not exposed | General user service |
+| Backend B | `backend_b:8002` | Not exposed | Admin service |
+
+---
+
+## Route Policy
+
+| External Route | Internal Destination | Required Role |
+|---|---|---|
+| `/app/data` | `backend_a:8001/data` | `user` or `admin` |
+| `/admin/admin-data` | `backend_b:8002/admin-data` | `admin` only |
+
+The reverse proxy removes the first path segment before forwarding.
+
+Example:
+
+```text
+/app/data
+```
+
+forwards to:
+
+```text
+backend_a:8001/data
+```
+
+And:
+
+```text
+/admin/admin-data
+```
+
+forwards to:
+
+```text
+backend_b:8002/admin-data
+```
+
+---
 
 ## Prerequisites
 
-- Python 3.10+
-- `pip`
+- Docker Desktop
+- Docker Compose
+- Optional for non-Docker development:
+  - Python 3.10+
+  - `pip`
 
-## Setup
+---
 
-1. Create and activate a virtual environment:
+## Environment Setup
 
-```bash
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-```
-
-2. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Copy `.env.example` to `.env` and fill in values:
+Copy the example environment file:
 
 ```bash
 cp .env.example .env
@@ -89,7 +174,7 @@ cp .env.example .env
 Minimum `.env`:
 
 ```env
-JWT_SECRET=replace_with_a_256bit_random_hex_secret
+JWT_SECRET=replace-with-strong-random-secret
 JWT_ALGORITHM=HS256
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 REFRESH_TOKEN_EXPIRE_DAYS=7
@@ -97,201 +182,413 @@ AUTH_DB_PATH=auth.db
 PBKDF2_ITERATIONS=100000
 ```
 
-Generate a strong secret:
+Generate a strong JWT secret:
 
 ```bash
 python -c "import secrets; print(secrets.token_hex(32))"
 ```
 
-## Running Locally
+Replace `JWT_SECRET` in `.env` with the generated value.
 
-Make sure ports `8000`, `8001`, and `8002` are free before starting. Each service needs its own terminal. Run all commands from the project root.
-
-**Terminal 1 — Auth service**
-```bash
-uvicorn auth_service.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-**Terminal 2 — Backend service A**
-```bash
-uvicorn backend_service_a.main:app --host 0.0.0.0 --port 8001 --reload
-```
-
-**Terminal 3 — Backend service B**
-```bash
-uvicorn backend_service_b.main:app --host 0.0.0.0 --port 8002 --reload
-```
-
-To stop a service press `Ctrl+C` in its terminal. If a port is still in use after stopping, find and kill the process:
-
-```powershell
-# find the PID holding the port (replace 8000 with whichever port)
-netstat -ano | findstr :8000
-
-# kill it (replace <PID> with the number from the output)
-Stop-Process -Id <PID> -Force
-```
+---
 
 ## Running with Docker
 
-Requires Docker Desktop to be running.
+Start all services:
 
 ```bash
-# build images and start all 3 containers
 docker compose up --build
+```
 
-# start without rebuilding (after the first time)
-docker compose up
+After startup, open:
 
-# stop all containers
+```text
+http://localhost:8080
+```
+
+Stop all containers:
+
+```bash
 docker compose down
+```
 
-# stop and delete the database volume too
+Stop containers and reset the auth database volume:
+
+```bash
 docker compose down -v
 ```
 
-The auth service database (`auth.db`) is stored in a named Docker volume so it persists across restarts. It is reset only when you run `docker compose down -v`.
+---
 
 ## Seed Accounts
 
-On first startup the auth service auto-creates:
+On first startup, the auth service auto-creates:
 
-| Username | Password   | Role  |
-|----------|------------|-------|
-| `alice`  | `alice123` | user  |
-| `bob`    | `bob123`   | admin |
+| Username | Password | Role |
+|---|---|---|
+| `alice` | `alice123` | `user` |
+| `bob` | `bob123` | `admin` |
 
-The default admin (`bob`) cannot be deactivated.
+The default admin account `bob` cannot be deactivated through the API.
+
+---
+
+## Demo / Test Workflow
+
+### 1. Open the proxy homepage
+
+```text
+http://localhost:8080
+```
+
+The page shows:
+
+- current login status
+- current username and role, if logged in
+- available protected routes
+- test users
+
+---
+
+### 2. Unauthenticated user is redirected to login
+
+In a browser or private window, visit:
+
+```text
+http://localhost:8080/app/data
+```
+
+Expected result:
+
+```text
+redirected to /login
+```
+
+---
+
+### 3. Alice can access the general service
+
+Login as:
+
+```text
+alice / alice123
+```
+
+Then visit:
+
+```text
+http://localhost:8080/app/data
+```
+
+Expected response:
+
+```json
+{
+  "service": "service-a",
+  "message": "General internal data. Intended for authenticated users."
+}
+```
+
+---
+
+### 4. Alice cannot access the admin service
+
+While logged in as Alice, visit:
+
+```text
+http://localhost:8080/admin/admin-data
+```
+
+Expected result:
+
+```text
+403 Forbidden
+```
+
+Alice has role `user`, but `/admin/*` requires role `admin`.
+
+---
+
+### 5. Bob can access the admin service
+
+Logout:
+
+```text
+http://localhost:8080/logout
+```
+
+Login as:
+
+```text
+bob / bob123
+```
+
+Then visit:
+
+```text
+http://localhost:8080/admin/admin-data
+```
+
+Expected response:
+
+```json
+{
+  "service": "service-b",
+  "message": "Sensitive admin data. Intended for admins only."
+}
+```
+
+---
+
+### 6. Backend services are not directly reachable
+
+Try accessing backend services directly from the host:
+
+```text
+http://localhost:8001/data
+http://localhost:8002/admin-data
+```
+
+Expected result:
+
+```text
+connection refused / unable to connect
+```
+
+This demonstrates that backend services are isolated and can only be reached through the reverse proxy.
+
+---
+
+## Login and Session Behavior
+
+The reverse proxy hosts a small login page at:
+
+```text
+http://localhost:8080/login
+```
+
+After successful login, the proxy stores:
+
+```text
+access_token
+refresh_token
+```
+
+as `HttpOnly` cookies.
+
+Future browser requests automatically include these cookies. The proxy uses the access token to call:
+
+```text
+GET auth_service:8000/verify
+```
+
+If the access token expires, the proxy attempts to use the refresh token by calling:
+
+```text
+POST auth_service:8000/refresh
+```
+
+If refresh succeeds, new cookies are issued. If refresh fails, the user is redirected to login.
+
+The login page also detects if the user is already logged in. Logging in as a different account will revoke the previous session and replace the cookies with the new account session.
+
+---
+
+## Logout
+
+Visit:
+
+```text
+http://localhost:8080/logout
+```
+
+The reverse proxy calls the auth service `/logout` endpoint and clears local cookies.
+
+After logout, protected routes require login again.
+
+---
 
 ## Auth Service API
 
-Base URL: `http://localhost:8000`
+The auth service is internal to Docker during normal operation, but its API is documented in:
 
-| Method  | Endpoint                          | Auth required | Description                        |
-|---------|-----------------------------------|---------------|------------------------------------|
-| GET     | `/health`                         | No            | Health check                       |
-| POST    | `/register`                       | No            | Register a new user                |
-| POST    | `/login`                          | Username + password (body) | Login; returns access + refresh tokens |
-| GET     | `/verify`                         | Bearer token  | Validate JWT and return claims     |
-| POST    | `/refresh`                        | Refresh token (body) | Rotate refresh token, issue new access and refresh tokens |
-| GET     | `/me`                             | Bearer token  | Get current user profile           |
-| POST    | `/change-password`                | Bearer token  | Change own password                |
-| POST    | `/logout`                         | Bearer token  | Revoke current session             |
-| GET     | `/users`                          | Admin only    | List all users                     |
-| PATCH   | `/users/{username}/deactivate`    | Admin only    | Deactivate a user account          |
-
-### Register
-
-```bash
-curl -X POST http://localhost:8000/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"charlie","password":"charlie123","role":"user"}'
+```text
+AUTH_API.md
 ```
 
-### Login
+Main endpoints:
 
-```bash
-curl -X POST http://localhost:8000/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"alice123"}'
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Health check |
+| `POST` | `/register` | Register user |
+| `POST` | `/login` | Login and receive tokens |
+| `GET` | `/verify` | Validate access token |
+| `POST` | `/refresh` | Rotate refresh token and issue new access token |
+| `GET` | `/me` | Current user profile |
+| `POST` | `/change-password` | Change own password |
+| `POST` | `/logout` | Revoke current session |
+| `GET` | `/users` | Admin: list users |
+| `PATCH` | `/users/{username}/deactivate` | Admin: deactivate user |
 
-Response includes `access_token` (short-lived JWT) and `refresh_token`.
-
-### Verify Token
-
-```bash
-curl http://localhost:8000/verify \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### Refresh Access Token
-
-```bash
-curl -X POST http://localhost:8000/refresh \
-  -H "Content-Type: application/json" \
-  -d '{"refresh_token":"<refresh_token>"}'
-```
-
-Returns a new `access_token` and a rotated `refresh_token`. The old refresh token is immediately revoked.
-
-### Logout
-
-```bash
-curl -X POST http://localhost:8000/logout \
-  -H "Authorization: Bearer <access_token>"
-```
-
-Revokes the entire session; all tokens bound to that session become invalid.
-
-### Admin: List Users
-
-```bash
-curl http://localhost:8000/users \
-  -H "Authorization: Bearer <admin_access_token>"
-```
-
-### Admin: Deactivate User
-
-```bash
-curl -X PATCH http://localhost:8000/users/charlie/deactivate \
-  -H "Authorization: Bearer <admin_access_token>"
-```
+---
 
 ## Backend APIs
 
-**Service A** — `http://localhost:8001` (any authenticated user)
+Backend services are not exposed directly to the host in the Docker setup.
 
-| Method | Endpoint  | Description      |
-|--------|-----------|------------------|
-| GET    | `/health` | Health check     |
-| GET    | `/data`   | General resource |
+They are reachable only through the reverse proxy.
 
-**Service B** — `http://localhost:8002` (admin role only)
+### Service A
 
-| Method | Endpoint      | Description            |
-|--------|---------------|------------------------|
-| GET    | `/health`     | Health check           |
-| GET    | `/admin-data` | Sensitive admin resource |
+External route:
 
-## Quick Test (PowerShell)
-
-```powershell
-# Login as alice
-$login = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/login `
-  -ContentType "application/json" `
-  -Body '{"username":"alice","password":"alice123"}'
-
-# Verify token
-Invoke-RestMethod -Uri http://127.0.0.1:8000/verify `
-  -Headers @{ Authorization = "Bearer $($login.access_token)" }
-
-# Refresh token
-$refreshed = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/refresh `
-  -ContentType "application/json" `
-  -Body "{`"refresh_token`":`"$($login.refresh_token)`"}"
-
-# Logout (revokes session)
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/logout `
-  -Headers @{ Authorization = "Bearer $($login.access_token)" }
+```text
+http://localhost:8080/app/data
 ```
 
-## Database Schema
+Internal route:
 
-SQLite file at `AUTH_DB_PATH` (default `auth.db`). Created automatically on first run.
+```text
+backend_a:8001/data
+```
 
-**`users`** — `id`, `username` (unique), `password_hash` (salt$digest), `role` (user|admin), `is_active`
+Required role:
 
-**`sessions`** — `id` (UUID), `user_id`, `is_revoked`, `created_at`, `revoked_at`
+```text
+user or admin
+```
 
-**`refresh_tokens`** — `id`, `token_hash` (SHA-256), `user_id`, `session_id`, `expires_at`, `created_at`, `is_revoked`, `revoked_at`, `replaced_by_hash`
+---
+
+### Service B
+
+External route:
+
+```text
+http://localhost:8080/admin/admin-data
+```
+
+Internal route:
+
+```text
+backend_b:8002/admin-data
+```
+
+Required role:
+
+```text
+admin
+```
+
+---
+
+## Identity Propagation
+
+When the proxy forwards an allowed request, it includes identity headers for the backend:
+
+```http
+X-Forwarded-User: alice
+X-Forwarded-User-Id: 1
+X-Forwarded-Role: user
+X-Forwarded-Session-Id: <session-id>
+```
+
+Backends may read these headers for display or logging, but authorization decisions are enforced by the reverse proxy.
+
+These headers should only be trusted because the backend services are isolated and cannot be accessed directly by users.
+
+---
+
+## Running Without Docker
+
+Docker Compose is the recommended setup because it demonstrates backend isolation.
+
+For development only, you can run each service manually in separate terminals:
+
+```bash
+uvicorn auth_service.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn backend_service_a.main:app --host 0.0.0.0 --port 8001 --reload
+uvicorn backend_service_b.main:app --host 0.0.0.0 --port 8002 --reload
+uvicorn reverse_proxy.main:app --host 0.0.0.0 --port 8080 --reload
+```
+
+When running locally this way, backend ports are exposed on your machine, so this mode does not demonstrate backend isolation.
+
+---
 
 ## Security Notes
 
-- **JWT_SECRET** must be set in `.env` and kept secret; never commit it.
-- **Password hashing**: PBKDF2-HMAC-SHA256 with a per-user random salt and 100 000 iterations; constant-time comparison via `hmac.compare_digest` prevents timing attacks.
-- **Refresh token rotation**: each `/refresh` call issues a new token and revokes the previous one. Reuse of an already-revoked refresh token triggers full session revocation.
-- **Session revocation**: `/logout` invalidates the session server-side, rendering all tokens for that session unusable immediately.
-- **Token types**: access tokens are JWTs with a `typ: "access"` claim — the server rejects any JWT where this claim is missing or wrong. Refresh tokens are opaque random strings (`secrets.token_urlsafe(48)`), not JWTs; they are stored server-side as SHA-256 hashes and are only valid at `/refresh`.
-- **Admin protection**: the default admin account cannot be deactivated through the API.
-- **Prototype scope**: backend services do not independently verify tokens — in production, a reverse proxy (nginx, Traefik, Envoy) would enforce this boundary. Do not expose backend ports directly in a real deployment.
+- This is a prototype for demonstrating centralized authentication and RBAC.
+- Do not commit `.env` or real secrets.
+- `JWT_SECRET` must be strong and private.
+- Access tokens are short-lived JWTs.
+- Refresh tokens are opaque random tokens stored server-side as hashes.
+- Refresh token rotation is implemented.
+- Reuse of an old refresh token revokes the session.
+- Logout revokes the server-side session.
+- Backend applications do not verify tokens themselves.
+- Backend services must remain private and reachable only from the reverse proxy.
+- Cookies use `HttpOnly` and `SameSite=Lax`.
+- For a real deployment, use HTTPS and set cookie `Secure=True`.
+
+---
+
+## Troubleshooting
+
+### Port already in use
+
+Check what is using a port:
+
+```bash
+lsof -i :8080
+```
+
+Stop the process or change the exposed port in `docker-compose.yml`.
+
+---
+
+### Reset database
+
+If users or sessions are in a bad state, reset the Docker volume:
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
+---
+
+### Rebuild after code changes
+
+```bash
+docker compose up --build
+```
+
+---
+
+### Backend is reachable directly
+
+If this works:
+
+```text
+http://localhost:8001/data
+```
+
+then the backend is being exposed incorrectly.
+
+Check `docker-compose.yml` and make sure backend services use:
+
+```yaml
+expose:
+  - "8001"
+```
+
+not:
+
+```yaml
+ports:
+  - "8001:8001"
+```
+
+Only the reverse proxy should have a `ports:` mapping.
