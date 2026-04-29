@@ -137,9 +137,9 @@ Base URL: `http://localhost:8000`
 |---------|-----------------------------------|---------------|------------------------------------|
 | GET     | `/health`                         | No            | Health check                       |
 | POST    | `/register`                       | No            | Register a new user                |
-| POST    | `/login`                          | No            | Login; returns access + refresh tokens |
+| POST    | `/login`                          | Username + password (body) | Login; returns access + refresh tokens |
 | GET     | `/verify`                         | Bearer token  | Validate JWT and return claims     |
-| POST    | `/refresh`                        | Refresh token | Rotate refresh token, issue new access token |
+| POST    | `/refresh`                        | Refresh token (body) | Rotate refresh token, issue new access and refresh tokens |
 | GET     | `/me`                             | Bearer token  | Get current user profile           |
 | POST    | `/change-password`                | Bearer token  | Change own password                |
 | POST    | `/logout`                         | Bearer token  | Revoke current session             |
@@ -258,6 +258,6 @@ SQLite file at `AUTH_DB_PATH` (default `auth.db`). Created automatically on firs
 - **Password hashing**: PBKDF2-HMAC-SHA256 with a per-user random salt and 100 000 iterations; constant-time comparison via `hmac.compare_digest` prevents timing attacks.
 - **Refresh token rotation**: each `/refresh` call issues a new token and revokes the previous one. Reuse of an already-revoked refresh token triggers full session revocation.
 - **Session revocation**: `/logout` invalidates the session server-side, rendering all tokens for that session unusable immediately.
-- **Token types**: access tokens and refresh tokens carry a `type` claim; the server rejects tokens presented to the wrong endpoint.
+- **Token types**: access tokens are JWTs with a `typ: "access"` claim — the server rejects any JWT where this claim is missing or wrong. Refresh tokens are opaque random strings (`secrets.token_urlsafe(48)`), not JWTs; they are stored server-side as SHA-256 hashes and are only valid at `/refresh`.
 - **Admin protection**: the default admin account cannot be deactivated through the API.
 - **Prototype scope**: backend services do not independently verify tokens — in production, a reverse proxy (nginx, Traefik, Envoy) would enforce this boundary. Do not expose backend ports directly in a real deployment.
