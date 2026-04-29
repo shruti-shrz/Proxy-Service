@@ -1,6 +1,6 @@
-# Proxy-Service (Shruti Scope)
+# Proxy-Service 
 
-FastAPI implementation for the Shruti portion of the project:
+FastAPI implementation for the Auth portion of the project:
 - Centralized authentication service
 - Two internal backend services to place behind a reverse proxy
 - Token validation endpoint for proxy integration
